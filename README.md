@@ -2,8 +2,8 @@
 
 A small, dependency-free background job queue for Elixir, built on plain OTP.
 
-> Work in progress. The core data structures and storage are in place; the
-> queue server and rate limiting land in follow-up commits.
+> Work in progress. The building blocks are in place; the queue server that
+> ties them together lands in a follow-up commit.
 
 ## What's here so far
 
@@ -12,6 +12,9 @@ A small, dependency-free background job queue for Elixir, built on plain OTP.
 - `Jobforge.PQueue` - a persistent pairing-heap priority queue with FIFO tie-breaking
 - `Jobforge.Store` - a behaviour for job storage, with `Store.Memory` (a map) and
   `Store.DETS` (a disk table that reloads every fully written job after a crash)
+- `Jobforge.Worker` - the behaviour job modules implement, with `use` defaults and
+  result normalisation (exceptions, throws and exits become errors)
+- `Jobforge.RateLimiter` - a pure token bucket that reports how long to wait
 
 ## Running the tests
 
