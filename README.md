@@ -2,8 +2,23 @@
 
 A small, dependency-free background job queue for Elixir, built on plain OTP.
 
-> Work in progress. The building blocks are in place; the queue server that
-> ties them together lands in a follow-up commit.
+> Work in progress: a demo task and fuller docs are coming.
+
+```elixir
+defmodule Greeter do
+  use Jobforge.Worker, max_attempts: 3
+
+  @impl true
+  def perform(%Jobforge.Job{args: %{"name" => name}}) do
+    IO.puts("hello " <> name)
+    :ok
+  end
+end
+
+{:ok, q} = Jobforge.start_link(concurrency: 5, store: {Jobforge.Store.DETS, path: "jobs.dets"})
+{:ok, _job} = Jobforge.insert(q, Greeter, %{"name" => "Ada"}, priority: 1, schedule_in: 1_000)
+:ok = Jobforge.drain(q)
+```
 
 ## What's here so far
 
@@ -15,6 +30,9 @@ A small, dependency-free background job queue for Elixir, built on plain OTP.
 - `Jobforge.Worker` - the behaviour job modules implement, with `use` defaults and
   result normalisation (exceptions, throws and exits become errors)
 - `Jobforge.RateLimiter` - a pure token bucket that reports how long to wait
+- `Jobforge.Queue` - the GenServer that ties it together: priorities, delayed jobs,
+  bounded concurrency, retries with backoff, per-attempt timeouts, snooze, cancel,
+  unique keys, rate limiting, dead letters, events and crash recovery
 
 ## Running the tests
 
