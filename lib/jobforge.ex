@@ -33,6 +33,9 @@ defmodule Jobforge do
   defdelegate resume(queue), to: Queue
   defdelegate stats(queue), to: Queue
   defdelegate drain(queue, timeout \\ 5_000), to: Queue
+  defdelegate schedule_cron(queue, name, expr, worker, args, job_opts \\ []), to: Queue
+  defdelegate unschedule_cron(queue, name), to: Queue
+  defdelegate crontab(queue), to: Queue
   defdelegate stop(queue), to: Queue
 
   @doc "Child spec so a queue can sit directly in a supervision tree."

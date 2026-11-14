@@ -14,8 +14,26 @@ defmodule Jobforge.Queue do
     * `:timeout` - default per-attempt timeout in ms (default `:infinity`)
     * `:on_event` - `fn event, job, meta -> any end`, called from the queue
       process for `:inserted`, `:started`, `:completed`, `:failed`,
-      `:discarded`, `:snoozed` and `:cancelled`. Keep it fast.
+      `:discarded`, `:snoozed`, `:cancelled` and `:cron_skipped`. Keep it fast.
     * `:paused` - start without running jobs (default `false`)
+    * `:crontab` - recurring jobs, a list of `{name, expr, worker, args}` or
+      `{name, expr, worker, args, job_opts}` (see `schedule_cron/6`)
+
+  ## Recurring jobs
+
+  Crontab entries insert a fresh job each time their `Jobforge.Cron`
+  expression fires (in UTC). By default an entry never overlaps itself: the
+  jobs it inserts share the unique key `{:jobforge_cron, name}`, so while one
+  is still waiting, retrying or running, the next tick is skipped and a
+  `:cron_skipped` event is emitted instead. Pass your own `:unique` in the
+  job options to change that. Inserted jobs carry `meta.cron` (the entry
+  name) and `meta.scheduled_for` (the tick, in ms).
+
+  Missed ticks are not backfilled: after a pause in the VM or a restart, an
+  entry fires at most once to catch up and then follows its schedule from
+  the current time. The crontab itself lives in the queue process (it comes
+  from code, not the store), so pass it in `:crontab` to have it back after
+  a restart. Entries don't keep `drain/2` waiting.
 
   ## Guarantees
 
@@ -29,7 +47,7 @@ defmodule Jobforge.Queue do
   use GenServer
   require Logger
 
-  alias Jobforge.{Backoff, Job, PQueue, RateLimiter, Worker}
+  alias Jobforge.{Backoff, Cron, Job, PQueue, RateLimiter, Worker}
 
   defstruct [
     :store_mod,
@@ -48,6 +66,7 @@ defmodule Jobforge.Queue do
     concurrency: 10,
     paused: false,
     waiters: [],
+    cron: %{},
     counts: %{completed: 0, failed: 0, discarded: 0, cancelled: 0, snoozed: 0}
   ]
 
@@ -123,6 +142,28 @@ defmodule Jobforge.Queue do
   @spec drain(queue(), timeout()) :: :ok
   def drain(queue, timeout \\ 5_000), do: GenServer.call(queue, :drain, timeout)
 
+  @doc """
+  Adds or replaces the recurring entry `name`: every time `expr` (a
+  `Jobforge.Cron` expression) fires, a job for `worker` with `args` and
+  `job_opts` is inserted. Returns the first fire time in Unix ms.
+  """
+  @spec schedule_cron(queue(), term(), String.t(), module(), term(), keyword()) ::
+          {:ok, integer()} | {:error, term()}
+  def schedule_cron(queue, name, expr, worker, args, job_opts \\ []),
+    do: GenServer.call(queue, {:schedule_cron, name, expr, worker, args, job_opts})
+
+  @doc "Removes a recurring entry. Jobs it already inserted are left alone."
+  @spec unschedule_cron(queue(), term()) :: :ok | {:error, :not_found}
+  def unschedule_cron(queue, name), do: GenServer.call(queue, {:unschedule_cron, name})
+
+  @doc """
+  Lists recurring entries sorted by next fire time, as maps with `:name`,
+  `:expr`, `:worker`, `:args`, `:opts`, `:next_at` (Unix ms), `:last_job_id`
+  and `:skipped` (ticks skipped because the previous job hadn't finished).
+  """
+  @spec crontab(queue()) :: [map()]
+  def crontab(queue), do: GenServer.call(queue, :crontab)
+
   @doc "Stops the queue, closing its store."
   @spec stop(queue()) :: :ok
   def stop(queue), do: GenServer.stop(queue)
@@ -134,7 +175,8 @@ defmodule Jobforge.Queue do
     Process.flag(:trap_exit, true)
     {store_mod, store_opts} = Keyword.get(opts, :store, {Jobforge.Store.Memory, []})
 
-    with {:ok, store} <- store_mod.init(store_opts),
+    with {:ok, cron} <- load_crontab(Keyword.get(opts, :crontab, []), now()),
+         {:ok, store} <- store_mod.init(store_opts),
          {:ok, sup} <- Task.Supervisor.start_link() do
       now = now()
 
@@ -153,7 +195,8 @@ defmodule Jobforge.Queue do
         default_timeout: Keyword.get(opts, :timeout, :infinity),
         on_event: Keyword.get(opts, :on_event),
         concurrency: Keyword.get(opts, :concurrency, 10),
-        paused: Keyword.get(opts, :paused, false)
+        paused: Keyword.get(opts, :paused, false),
+        cron: cron
       }
 
       s = store_mod.all(store) |> Enum.reduce(s, &recover(&2, &1, now))
@@ -255,6 +298,33 @@ defmodule Jobforge.Queue do
     end
   end
 
+  def handle_call({:schedule_cron, name, expr, worker, args, opts}, _from, s) do
+    case cron_entry(name, expr, worker, args, opts, now()) do
+      {:ok, entry} ->
+        s = %{s | cron: Map.put(s.cron, name, entry)}
+        {:reply, {:ok, entry.next_at}, dispatch(s)}
+
+      {:error, _} = e ->
+        {:reply, e, s}
+    end
+  end
+
+  def handle_call({:unschedule_cron, name}, _from, s) do
+    if Map.has_key?(s.cron, name),
+      do: {:reply, :ok, dispatch(%{s | cron: Map.delete(s.cron, name)})},
+      else: {:reply, {:error, :not_found}, s}
+  end
+
+  def handle_call(:crontab, _from, s) do
+    entries =
+      s.cron
+      |> Map.values()
+      |> Enum.sort_by(&{&1.next_at, inspect(&1.name)})
+      |> Enum.map(&Map.drop(&1, [:cron]))
+
+    {:reply, entries, s}
+  end
+
   def handle_call(:pause, _from, s), do: {:reply, :ok, %{s | paused: true}}
   def handle_call(:resume, _from, s), do: {:reply, :ok, dispatch(%{s | paused: false})}
 
@@ -275,7 +345,8 @@ defmodule Jobforge.Queue do
         cancelled_total: s.counts.cancelled,
         snoozed_total: s.counts.snoozed,
         concurrency: s.concurrency,
-        paused: s.paused
+        paused: s.paused,
+        cron_entries: map_size(s.cron)
       })
 
     {:reply, stats, s}
@@ -319,7 +390,120 @@ defmodule Jobforge.Queue do
 
   defp dispatch(s) do
     now = now()
-    s |> promote_due(now) |> start_ready(now) |> arm_timer(now) |> notify_waiters()
+
+    s
+    |> fire_cron(now)
+    |> promote_due(now)
+    |> start_ready(now)
+    |> arm_timer(now)
+    |> notify_waiters()
+  end
+
+  ## Crontab
+
+  defp load_crontab(entries, _now) when not is_list(entries),
+    do: {:error, {:invalid_crontab, entries}}
+
+  defp load_crontab(entries, now) do
+    Enum.reduce_while(entries, {:ok, %{}}, fn spec, {:ok, acc} ->
+      result =
+        case spec do
+          {name, expr, worker, args} -> cron_entry(name, expr, worker, args, [], now)
+          {name, expr, worker, args, opts} -> cron_entry(name, expr, worker, args, opts, now)
+          other -> {:error, {:invalid_crontab_entry, other}}
+        end
+
+      case result do
+        {:ok, entry} ->
+          if Map.has_key?(acc, entry.name),
+            do: {:halt, {:error, {:duplicate_cron, entry.name}}},
+            else: {:cont, {:ok, Map.put(acc, entry.name, entry)}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp cron_entry(name, expr, worker, args, opts, now) do
+    with {:ok, cron} <- Cron.parse(expr),
+         true <- Worker.valid?(worker) || {:error, {:invalid_worker, worker}},
+         true <- Keyword.keyword?(opts) || {:error, {:invalid_job_opts, opts}},
+         bad = Keyword.take(opts, [:id, :run_at, :schedule_in, :now]),
+         true <- bad == [] || {:error, {:unsupported_cron_opts, Keyword.keys(bad)}},
+         {:ok, _} <- build_cron_job(name, worker, args, opts, now),
+         {:ok, next_at} <- Cron.next(cron, now) do
+      {:ok,
+       %{
+         name: name,
+         expr: expr,
+         cron: cron,
+         worker: worker,
+         args: args,
+         opts: opts,
+         next_at: next_at,
+         last_job_id: nil,
+         skipped: 0
+       }}
+    else
+      {:error, :never} ->
+        {:error, {:cron_never_fires, expr}}
+
+      {:error, {field, _text, _why} = reason} when is_atom(field) ->
+        {:error, {:invalid_cron, reason}}
+
+      {:error, _} = e ->
+        e
+    end
+  end
+
+  defp build_cron_job(name, worker, args, opts, tick) do
+    meta =
+      opts
+      |> Keyword.get(:meta, %{})
+      |> Map.new()
+      |> Map.merge(%{cron: name, scheduled_for: tick})
+
+    opts =
+      Worker.defaults(worker)
+      |> Keyword.put_new(:unique, {:jobforge_cron, name})
+      |> Keyword.merge(opts)
+      |> Keyword.put(:meta, meta)
+
+    Job.new(worker, args, opts)
+  end
+
+  # Insert a job for every entry whose tick has come, then move each entry to
+  # its next tick after `now` (missed ticks collapse into this one).
+  defp fire_cron(s, now) do
+    s.cron
+    |> Map.values()
+    |> Enum.filter(&(&1.next_at <= now))
+    |> Enum.sort_by(& &1.next_at)
+    |> Enum.reduce(s, fn entry, s ->
+      {s, entry} = cron_insert(s, entry, now)
+
+      case Cron.next(entry.cron, now) do
+        {:ok, next_at} -> %{s | cron: Map.put(s.cron, entry.name, %{entry | next_at: next_at})}
+        {:error, :never} -> %{s | cron: Map.delete(s.cron, entry.name)}
+      end
+    end)
+  end
+
+  defp cron_insert(s, entry, now) do
+    {:ok, job} = build_cron_job(entry.name, entry.worker, entry.args, entry.opts, entry.next_at)
+    job = %{job | inserted_at: now, run_at: now, state: :available}
+
+    case unique_free(s, job) do
+      :ok ->
+        s = s |> put_job(job) |> enqueue(job)
+        emit(s, :inserted, job, %{cron: entry.name})
+        {s, %{entry | last_job_id: job.id}}
+
+      {:error, {:duplicate, existing}} ->
+        emit(s, :cron_skipped, job, %{cron: entry.name, running: existing})
+        {s, %{entry | skipped: entry.skipped + 1}}
+    end
   end
 
   # Move scheduled jobs whose time has come into the ready heap.
@@ -444,7 +628,7 @@ defmodule Jobforge.Queue do
   # without a message arriving: the next scheduled job or a rate-limit refill.
   defp arm_timer(s, now) do
     next =
-      [next_scheduled(s), next_token(s, now)]
+      [next_scheduled(s), next_token(s, now), next_cron(s)]
       |> Enum.reject(&is_nil/1)
       |> Enum.min(fn -> nil end)
 
@@ -474,6 +658,9 @@ defmodule Jobforge.Queue do
       :empty -> nil
     end
   end
+
+  defp next_cron(%{cron: cron}) when map_size(cron) == 0, do: nil
+  defp next_cron(s), do: s.cron |> Map.values() |> Enum.map(& &1.next_at) |> Enum.min()
 
   defp next_token(%{limiter: nil}, _now), do: nil
   defp next_token(%{paused: true}, _now), do: nil

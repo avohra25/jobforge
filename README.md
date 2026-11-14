@@ -31,6 +31,7 @@ end
 - **Rate limiting** with a token bucket on attempt starts
 - **Persistence**: an in-memory store, or a DETS store that survives restarts
 - **Dead letters**: discarded and cancelled jobs stay around to inspect or retry
+- **Recurring jobs** from a crontab (cron expressions, optional seconds), without overlap by default
 - **Events** through an `on_event` callback, plus `stats/1` counters
 
 ## Worker return values
@@ -57,6 +58,34 @@ can override the queue's retry policy with the optional `backoff/1` callback.
 | `:timeout` | `:infinity` | default per-attempt timeout in ms |
 | `:on_event` | none | `fn event, job, meta -> any end` |
 | `:paused` | `false` | start without running jobs |
+| `:crontab` | `[]` | recurring entries, `{name, expr, worker, args}` or `{name, expr, worker, args, job_opts}` |
+
+## Recurring jobs
+
+Give the queue a crontab, or manage entries at runtime:
+
+```elixir
+{:ok, q} =
+  Jobforge.start_link(
+    crontab: [
+      {"nightly-report", "0 3 * * *", ReportWorker, %{"kind" => "daily"}},
+      {"heartbeat", "*/30 * * * * *", PingWorker, %{}, priority: -1}
+    ]
+  )
+
+{:ok, next_at_ms} = Jobforge.schedule_cron(q, "cleanup", "@hourly", CleanupWorker, %{})
+Jobforge.crontab(q)          # entries with :next_at, :last_job_id and :skipped
+:ok = Jobforge.unschedule_cron(q, "cleanup")
+```
+
+Each tick inserts an ordinary job (so retries, timeouts, priorities and rate
+limits all apply) tagged with `meta.cron` and `meta.scheduled_for`. An entry
+never overlaps itself: while its previous job is still waiting, retrying or
+running, the tick is skipped and a `:cron_skipped` event is emitted. Pass your
+own `unique:` in the job options (`unique: nil` to allow overlap) to change
+that. Missed ticks aren't backfilled; after a pause or restart an entry fires
+once to catch up, then follows its schedule. The crontab is configuration, so
+it isn't written to the store, and it doesn't keep `drain/2` waiting.
 
 ## Cron expressions
 
