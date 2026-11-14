@@ -58,6 +58,28 @@ can override the queue's retry policy with the optional `backoff/1` callback.
 | `:on_event` | none | `fn event, job, meta -> any end` |
 | `:paused` | `false` | start without running jobs |
 
+## Cron expressions
+
+`Jobforge.Cron` parses Vixie-style cron expressions and computes fire times,
+in UTC:
+
+```elixir
+cron = Jobforge.Cron.parse!("*/15 9-17 * * MON-FRI")
+Jobforge.Cron.next(cron, ~U[2026-11-13 17:50:00Z])
+#=> {:ok, ~U[2026-11-16 09:00:00Z]}
+Jobforge.Cron.stream(cron, DateTime.utc_now()) |> Enum.take(3)
+```
+
+- Five fields (minute, hour, day of month, month, day of week), or six with a
+  leading seconds field (`"*/10 * * * * *"`)
+- `*`, values, `a-b` ranges, `*/n`, `a-b/n` and `a/n` steps, comma lists,
+  `JAN`-`DEC` and `SUN`-`SAT` names; day of week 0 and 7 are both Sunday
+- Vixie's rule for days: if both day of month and day of week are restricted,
+  either one matching is enough (`"0 0 1 * MON"` is the 1st *and* Mondays)
+- Macros `@yearly`/`@annually`, `@monthly`, `@weekly`, `@daily`/`@midnight`, `@hourly`
+- Errors say which field is wrong, e.g. `{:error, {:hour, "5-2", {:reversed_range, 5, 2}}}`;
+  schedules that can never fire (`"0 0 30 2 *"`) return `{:error, :never}`
+
 ## Guarantees
 
 Every state change is written to the store before the queue acts on it. If the
