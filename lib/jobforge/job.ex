@@ -6,6 +6,7 @@ defmodule Jobforge.Job do
 
     * `:available` - ready to run now
     * `:scheduled` - waiting for `run_at` (new delayed job or a retry in backoff)
+    * `:blocked` - waiting for the jobs in `depends_on` to complete
     * `:executing` - currently running
     * `:completed` - finished successfully (terminal)
     * `:discarded` - ran out of attempts (terminal, kept as a dead letter)
@@ -15,7 +16,7 @@ defmodule Jobforge.Job do
   stay meaningful after a restart when jobs are reloaded from a store.
   """
 
-  @states [:available, :scheduled, :executing, :completed, :discarded, :cancelled]
+  @states [:available, :scheduled, :blocked, :executing, :completed, :discarded, :cancelled]
   @terminal [:completed, :discarded, :cancelled]
 
   @enforce_keys [:id, :worker]
@@ -34,10 +35,12 @@ defmodule Jobforge.Job do
     max_attempts: 5,
     state: :available,
     errors: [],
+    depends_on: [],
     meta: %{}
   ]
 
-  @type state :: :available | :scheduled | :executing | :completed | :discarded | :cancelled
+  @type state ::
+          :available | :scheduled | :blocked | :executing | :completed | :discarded | :cancelled
   @type error_entry :: %{attempt: non_neg_integer(), at: integer(), error: term()}
   @type t :: %__MODULE__{
           id: String.t(),
@@ -54,6 +57,7 @@ defmodule Jobforge.Job do
           errors: [error_entry()],
           unique: term(),
           timeout: pos_integer() | :infinity | nil,
+          depends_on: [String.t()],
           meta: map()
         }
 
@@ -67,6 +71,7 @@ defmodule Jobforge.Job do
     :unique,
     :timeout,
     :meta,
+    :depends_on,
     :now
   ]
 
@@ -84,6 +89,8 @@ defmodule Jobforge.Job do
     * `:unique` - a key; at most one non-terminal job per key may exist in a queue.
       Pass `:args` to use `{worker, args}` as the key.
     * `:timeout` - per-attempt timeout in ms (`nil` uses the queue default)
+    * `:depends_on` - job ids (or `%Job{}`s) that must complete first; the
+      job stays `:blocked` until they do (see `Jobforge.Queue`)
     * `:queue`, `:meta`, `:id` - labels, free-form metadata, explicit id
   """
   @spec new(module(), term(), keyword()) :: {:ok, t()} | {:error, term()}
@@ -101,7 +108,10 @@ defmodule Jobforge.Job do
          timeout = Keyword.get(opts, :timeout),
          :ok <- check(valid_timeout?(timeout), {:invalid_timeout, timeout}),
          now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:millisecond) end),
-         {:ok, run_at} <- run_at(opts, now) do
+         {:ok, run_at} <- run_at(opts, now),
+         {:ok, deps} <- depends_on(Keyword.get(opts, :depends_on, [])),
+         id = Keyword.get_lazy(opts, :id, &generate_id/0),
+         :ok <- check(id not in deps, {:depends_on_itself, id}) do
       unique =
         case Keyword.get(opts, :unique) do
           :args -> {worker, args}
@@ -110,7 +120,7 @@ defmodule Jobforge.Job do
 
       {:ok,
        %__MODULE__{
-         id: Keyword.get_lazy(opts, :id, &generate_id/0),
+         id: id,
          worker: worker,
          args: args,
          queue: to_string(Keyword.get(opts, :queue, "default")),
@@ -118,9 +128,10 @@ defmodule Jobforge.Job do
          max_attempts: max_attempts,
          run_at: run_at,
          inserted_at: now,
-         state: if(run_at > now, do: :scheduled, else: :available),
+         state: initial_state(deps, run_at, now),
          unique: unique,
          timeout: timeout,
+         depends_on: deps,
          meta: Map.new(Keyword.get(opts, :meta, %{}))
        }}
     end
@@ -154,6 +165,11 @@ defmodule Jobforge.Job do
     %{job | errors: [%{attempt: job.attempt, at: now, error: error} | job.errors]}
   end
 
+  @doc false
+  def initial_state([_ | _], _run_at, _now), do: :blocked
+  def initial_state([], run_at, now) when run_at > now, do: :scheduled
+  def initial_state([], _run_at, _now), do: :available
+
   @doc "Generates a random 16-character hex id."
   @spec generate_id() :: String.t()
   def generate_id, do: :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
@@ -169,6 +185,20 @@ defmodule Jobforge.Job do
   defp check(false, reason), do: {:error, reason}
 
   defp valid_timeout?(t), do: is_nil(t) or t == :infinity or (is_integer(t) and t > 0)
+
+  defp depends_on(list) when is_list(list) do
+    Enum.reduce_while(list, {:ok, []}, fn
+      %__MODULE__{id: id}, {:ok, acc} -> {:cont, {:ok, [id | acc]}}
+      id, {:ok, acc} when is_binary(id) -> {:cont, {:ok, [id | acc]}}
+      other, _ -> {:halt, {:error, {:invalid_depends_on, other}}}
+    end)
+    |> case do
+      {:ok, ids} -> {:ok, ids |> Enum.reverse() |> Enum.uniq()}
+      error -> error
+    end
+  end
+
+  defp depends_on(other), do: {:error, {:invalid_depends_on, other}}
 
   defp run_at(opts, now) do
     case {Keyword.get(opts, :run_at), Keyword.get(opts, :schedule_in)} do

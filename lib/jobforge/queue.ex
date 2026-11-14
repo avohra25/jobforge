@@ -19,6 +19,18 @@ defmodule Jobforge.Queue do
     * `:crontab` - recurring jobs, a list of `{name, expr, worker, args}` or
       `{name, expr, worker, args, job_opts}` (see `schedule_cron/6`)
 
+  ## Dependencies
+
+  A job inserted with `depends_on: [id, ...]` is `:blocked` until every
+  listed job has completed, then becomes available (or scheduled, if its
+  `run_at` is still ahead). If a dependency is discarded or cancelled, the
+  blocked job is cancelled with `{:dependency_failed, id}`, and so on down the
+  chain. Ids the queue doesn't know count as completed, since completed jobs
+  are forgotten; inserting a job whose dependency already failed cancels it
+  straight away. `retry/2` re-checks dependencies and returns
+  `{:error, {:dependency_failed, id}}` while one has still failed. Blocked
+  jobs are persisted like any other and re-linked after a restart.
+
   ## Recurring jobs
 
   Crontab entries insert a fresh job each time their `Jobforge.Cron`
@@ -67,6 +79,7 @@ defmodule Jobforge.Queue do
     paused: false,
     waiters: [],
     cron: %{},
+    dependents: %{},
     counts: %{completed: 0, failed: 0, discarded: 0, cancelled: 0, snoozed: 0}
   ]
 
@@ -200,6 +213,15 @@ defmodule Jobforge.Queue do
       }
 
       s = store_mod.all(store) |> Enum.reduce(s, &recover(&2, &1, now))
+
+      # Re-link blocked jobs now that every job is loaded.
+      s =
+        s.jobs
+        |> Map.values()
+        |> Enum.filter(&(&1.state == :blocked))
+        |> Jobforge.Store.sort()
+        |> Enum.reduce(s, fn job, s -> settle(s, job, now) end)
+
       {:ok, s, {:continue, :dispatch}}
     else
       {:error, reason} -> {:stop, reason}
@@ -208,6 +230,9 @@ defmodule Jobforge.Queue do
 
   # An attempt that was executing when the queue went down never reported
   # back. Hand it out again (at-least-once) and note why.
+  defp recover(s, job, now) when not is_map_key(job, :depends_on),
+    do: recover(s, Map.put(job, :depends_on, []), now)
+
   defp recover(s, %Job{state: :executing} = job, now) do
     job =
       job |> Job.record_error(:interrupted, now) |> Map.merge(%{state: :available, run_at: now})
@@ -230,9 +255,9 @@ defmodule Jobforge.Queue do
         if Map.has_key?(s.jobs, job.id) do
           {:reply, {:error, {:duplicate_id, job.id}}, s}
         else
-          s = s |> put_job(job) |> enqueue(job)
           emit(s, :inserted, job, %{})
-          {:reply, {:ok, job}, dispatch(s)}
+          s = settle(s, job, now())
+          {:reply, {:ok, Map.fetch!(s.jobs, job.id)}, dispatch(s)}
         end
     end
   end
@@ -280,10 +305,11 @@ defmodule Jobforge.Queue do
   def handle_call({:retry, id}, _from, s) do
     with {:ok, job} <- fetch(s, id),
          true <- job.state in [:discarded, :cancelled] || {:error, :not_finished},
-         :ok <- unique_free(s, job) do
-      job = %{job | state: :available, attempt: 0, run_at: now()}
-      s = s |> put_job(job) |> enqueue(job)
-      {:reply, {:ok, job}, dispatch(s)}
+         :ok <- unique_free(s, job),
+         :ok <- deps_ok(s, job) do
+      now = now()
+      s = settle(s, %{job | state: :blocked, attempt: 0, run_at: now}, now)
+      {:reply, {:ok, Map.fetch!(s.jobs, id)}, dispatch(s)}
     else
       {:error, _} = e -> {:reply, e, s}
     end
@@ -429,7 +455,7 @@ defmodule Jobforge.Queue do
     with {:ok, cron} <- Cron.parse(expr),
          true <- Worker.valid?(worker) || {:error, {:invalid_worker, worker}},
          true <- Keyword.keyword?(opts) || {:error, {:invalid_job_opts, opts}},
-         bad = Keyword.take(opts, [:id, :run_at, :schedule_in, :now]),
+         bad = Keyword.take(opts, [:id, :run_at, :schedule_in, :depends_on, :now]),
          true <- bad == [] || {:error, {:unsupported_cron_opts, Keyword.keys(bad)}},
          {:ok, _} <- build_cron_job(name, worker, args, opts, now),
          {:ok, next_at} <- Cron.next(cron, now) do
@@ -588,7 +614,7 @@ defmodule Jobforge.Queue do
       case result do
         :ok ->
           emit(s, :completed, %{job | state: :completed}, meta)
-          s |> forget(job) |> bump(:completed)
+          s |> forget(job) |> bump(:completed) |> unblock_dependents(job.id, now)
 
         {:snooze, ms} ->
           job = %{job | state: :scheduled, run_at: now + ms, attempt: job.attempt - 1}
@@ -611,7 +637,7 @@ defmodule Jobforge.Queue do
           else
             job = %{job | state: :discarded}
             emit(s, :discarded, job, Map.put(meta, :error, reason))
-            s |> put_job(job) |> bump(:discarded)
+            s |> put_job(job) |> bump(:discarded) |> fail_dependents(job.id)
           end
       end
 
@@ -742,7 +768,90 @@ defmodule Jobforge.Queue do
     job = if reason, do: Job.record_error(job, reason, now()), else: job
     job = %{job | state: :cancelled}
     emit(s, :cancelled, job, %{})
-    {s |> put_job(job) |> bump(:cancelled), job}
+    {s |> put_job(job) |> bump(:cancelled) |> fail_dependents(job.id), job}
+  end
+
+  ## Dependencies
+
+  # Decide where a job that may have dependencies goes: cancelled if one has
+  # failed, blocked while any is unfinished, otherwise ready or scheduled.
+  defp settle(s, %Job{depends_on: []} = job, now), do: ready(s, job, now)
+
+  defp settle(s, job, now) do
+    states = Enum.map(job.depends_on, &{&1, dep_state(s, &1)})
+
+    case Enum.find(states, fn {_, st} -> st in [:discarded, :cancelled] end) do
+      {failed, _} ->
+        {s, _} = mark_cancelled(s, job, {:dependency_failed, failed})
+        s
+
+      nil ->
+        case for({id, st} <- states, st != :done, do: id) do
+          [] ->
+            ready(s, job, now)
+
+          pending ->
+            job = %{job | state: :blocked}
+            s = put_job(s, job)
+
+            dependents =
+              Enum.reduce(pending, s.dependents, fn dep, acc ->
+                Map.update(acc, dep, MapSet.new([job.id]), &MapSet.put(&1, job.id))
+              end)
+
+            %{s | dependents: dependents}
+        end
+    end
+  end
+
+  defp ready(s, job, now) do
+    job = %{job | state: Job.initial_state([], job.run_at, now)}
+    s |> put_job(job) |> enqueue(job)
+  end
+
+  defp dep_state(s, id) do
+    case Map.fetch(s.jobs, id) do
+      :error -> :done
+      {:ok, %Job{state: state}} -> state
+    end
+  end
+
+  defp deps_ok(s, job) do
+    case Enum.find(job.depends_on, &(dep_state(s, &1) in [:discarded, :cancelled])) do
+      nil -> :ok
+      id -> {:error, {:dependency_failed, id}}
+    end
+  end
+
+  defp take_dependents(s, id) do
+    {ids, rest} = Map.pop(s.dependents, id, MapSet.new())
+
+    blocked =
+      ids |> Enum.map(&Map.get(s.jobs, &1)) |> Enum.filter(&match?(%Job{state: :blocked}, &1))
+
+    {%{s | dependents: rest}, Jobforge.Store.sort(blocked)}
+  end
+
+  defp unblock_dependents(s, id, now) do
+    {s, jobs} = take_dependents(s, id)
+    # settle/3 re-registers the job under any dependency still unfinished.
+    Enum.reduce(jobs, s, &settle(&2, &1, now))
+  end
+
+  defp fail_dependents(s, id) do
+    {s, jobs} = take_dependents(s, id)
+
+    Enum.reduce(jobs, s, fn job, s ->
+      # It may have been cancelled already through another failed dependency.
+      case Map.fetch(s.jobs, job.id) do
+        {:ok, %Job{state: :blocked} = job} ->
+          {s, _} = mark_cancelled(s, job, {:dependency_failed, id})
+          s
+
+        _ ->
+          s
+      end
+    end)
   end
 
   defp fetch(s, id) do

@@ -31,6 +31,7 @@ end
 - **Rate limiting** with a token bucket on attempt starts
 - **Persistence**: an in-memory store, or a DETS store that survives restarts
 - **Dead letters**: discarded and cancelled jobs stay around to inspect or retry
+- **Dependencies**: `depends_on:` holds a job until other jobs complete, and cancels it if one fails
 - **Recurring jobs** from a crontab (cron expressions, optional seconds), without overlap by default
 - **Events** through an `on_event` callback, plus `stats/1` counters
 
@@ -59,6 +60,26 @@ can override the queue's retry policy with the optional `backoff/1` callback.
 | `:on_event` | none | `fn event, job, meta -> any end` |
 | `:paused` | `false` | start without running jobs |
 | `:crontab` | `[]` | recurring entries, `{name, expr, worker, args}` or `{name, expr, worker, args, job_opts}` |
+
+## Dependencies
+
+```elixir
+{:ok, fetch} = Jobforge.insert(q, Fetch, %{"url" => url})
+{:ok, thumbs} = Jobforge.insert(q, Thumbnail, %{"url" => url}, depends_on: [fetch])
+{:ok, index} = Jobforge.insert(q, Index, %{"url" => url}, depends_on: [fetch])
+{:ok, _done} = Jobforge.insert(q, Notify, %{"url" => url}, depends_on: [thumbs.id, index.id])
+```
+
+A job with `depends_on` (job ids or `%Job{}`s) sits in the `:blocked` state
+until every dependency has completed, then becomes available, or scheduled if
+its own `run_at` is still ahead. If a dependency is discarded or cancelled,
+everything waiting on it is cancelled with `{:dependency_failed, id}`, down the
+whole chain. Since completed jobs are forgotten, an id the queue doesn't know
+counts as completed, and a job inserted after one of its dependencies already
+failed is cancelled right away. `retry/2` on such a job returns
+`{:error, {:dependency_failed, id}}` until that dependency is retried to
+success or deleted. Blocked jobs are stored like any other and re-linked when a
+DETS-backed queue restarts.
 
 ## Recurring jobs
 
@@ -147,9 +168,13 @@ partway through and rerun it to watch unfinished jobs resume.
 mix test
 ```
 
-54 tests, including a randomized stress test that throws successes, failures,
+85 tests, including a randomized stress test that throws successes, failures,
 snoozes, cancels, crashes and delays at a queue and checks that every job
-ends in exactly one terminal state without ever exceeding the concurrency limit.
+ends in exactly one terminal state without ever exceeding the concurrency limit,
+random dependency graphs with random outcomes (each job runs only after all its
+dependencies completed, and is cancelled exactly when one failed), and
+`Jobforge.Cron.next/2` checked against a brute-force minute scan on 400 random
+expressions.
 
 Requires Elixir 1.15+ and Erlang/OTP 25+. No dependencies.
 
